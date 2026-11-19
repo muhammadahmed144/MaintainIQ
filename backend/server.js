@@ -14,7 +14,7 @@ import { connectDB } from './src/config/db.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 async function startServer() {
   // Connect to MongoDB Atlas
@@ -22,8 +22,12 @@ async function startServer() {
 
   if (process.env.NODE_ENV !== 'production') {
     // Integrate Vite as a dev-server middleware
+    // Fixed HMR port to avoid WebSocket "port already in use" errors
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: { port: 5174 },
+      },
       appType: 'spa',
       root: path.resolve(__dirname, '../frontend')
     });
@@ -37,11 +41,26 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server listening at http://0.0.0.0:${PORT}`);
+  const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`✅ Server listening at http://0.0.0.0:${PORT}`);
+  });
+
+  // Graceful error handling — show a helpful message instead of crashing
+  server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`\n❌ Port ${PORT} is already in use.`);
+      console.error(`   Run this command to free it, then restart:\n`);
+      console.error(`   npx kill-port ${PORT}\n`);
+      process.exit(1);
+    } else {
+      console.error('Server error:', err);
+      process.exit(1);
+    }
   });
 }
 
 startServer().catch(err => {
   console.error('Fatal Server Startup Error:', err);
+  process.exit(1);
 });
+

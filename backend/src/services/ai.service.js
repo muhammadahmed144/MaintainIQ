@@ -1,71 +1,252 @@
+
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
+ *
+ * MaintainIQ - AI Service
+ * Gemini-powered maintenance intelligence and recommendations.
  */
 
 import { GoogleGenAI, Type } from '@google/genai';
+
 import Issue from '../models/Issue.js';
 import Asset from '../models/Asset.js';
 import User from '../models/User.js';
 import Maintenance from '../models/Maintenance.js';
 
-// Setup Google Gen AI client with appropriate telemetry header
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY || '',
-  httpOptions: {
-    headers: {
-      'User-Agent': 'aistudio-build',
-    }
-  }
-});
+// ============================================================
+// 1. GEMINI CONFIGURATION
+// ============================================================
+
+const GEMINI_MODEL =
+  process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+
+let aiClient = null;
 
 /**
- * Checks if Gemini API key is configured and functional
+ * Get Gemini client only when API key is available.
  */
-const hasAIKey = () => !!process.env.GEMINI_API_KEY;
+const getAIClient = () => {
+  const apiKey = process.env.GEMINI_API_KEY?.trim();
+
+  if (!apiKey) {
+    return null;
+  }
+
+  if (!aiClient) {
+    aiClient = new GoogleGenAI({
+      apiKey,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'MaintainIQ',
+        },
+      },
+    });
+  }
+
+  return aiClient;
+};
+
+const hasAIKey = () => {
+  return Boolean(process.env.GEMINI_API_KEY?.trim());
+};
+
+// ============================================================
+// 2. ERROR HANDLING
+// ============================================================
+
+const handleAIError = (context, err) => {
+  const status = err?.status || err?.code;
+  const message = err?.message || 'Unknown Gemini API error';
+
+  if (
+    status === 429 ||
+    message.includes('quota') ||
+    message.includes('RESOURCE_EXHAUSTED')
+  ) {
+    console.warn(
+      `⚠️ Gemini quota/rate limit exceeded in ${context}. Using fallback.`
+    );
+    return;
+  }
+
+  if (status === 404) {
+    console.error(
+      `❌ Gemini model or endpoint unavailable in ${context}.`,
+      message
+    );
+    return;
+  }
+
+  if (status === 401 || status === 403) {
+    console.error(
+      `❌ Gemini authentication/permission error in ${context}.`,
+      message
+    );
+    return;
+  }
+
+  console.error(`❌ ${context} Error:`, message);
+};
+
+// ============================================================
+// 3. RESPONSE HELPERS
+// ============================================================
+
+const getResponseText = (response) => {
+  const text = response?.text;
+
+  if (typeof text !== 'string' || !text.trim()) {
+    throw new Error('Gemini returned an empty response.');
+  }
+
+  return text.trim();
+};
+
+const parseAIJson = (response) => {
+  let text = getResponseText(response);
+
+  // Remove Markdown JSON code fences if present.
+  text = text
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/, '')
+    .trim();
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error('Gemini returned invalid JSON.');
+  }
+};
+
+const generateAIContent = async (contents, config = {}) => {
+  const client = getAIClient();
+
+  if (!client) {
+    throw new Error('GEMINI_API_KEY is not configured.');
+  }
+
+  return client.models.generateContent({
+    model: GEMINI_MODEL,
+    contents,
+    config,
+  });
+};
+
+// ============================================================
+// 4. FALLBACK RESPONSES
+// ============================================================
+
+const getMaintenanceSummaryFallback = (notes) => {
+  return `[ENGINEERING AUTO-REPORT]
+
+Maintenance inspection completed.
+
+Technician Notes:
+${notes}
+
+The reported observations have been recorded for maintenance review. Further verification should be performed according to the applicable maintenance procedure.`;
+};
+
+const getPreventiveRecommendationFallback = (asset) => {
+  return {
+    suggestedNextMaintenance:
+      asset.nextService || 'Next Quarter',
+
+    suggestedReplacement:
+      asset.condition === 'Poor'
+        ? 'Replacement assessment recommended within the next 3 months.'
+        : 'No immediate replacement recommendation. Continue monitoring.',
+
+    inspectionSchedule:
+      'Every 30 days - standard visual inspection.',
+
+    narrative:
+      'Perform routine inspections, clean operational surfaces, check critical components and verify equipment performance.',
+  };
+};
+
+const getRepairEstimateFallback = () => ({
+  estimatedTimeMinutes: 90,
+  estimatedCostMin: 100,
+  estimatedCostMax: 250,
+  confidence: 'Low',
+});
+
+// ============================================================
+// 5. AI SERVICE
+// ============================================================
 
 export const aiService = {
-  /**
-   * 1. AI Maintenance Summary
-   * Transforms raw technician notes into a structured, highly professional maintenance report.
-   */
+
+  // ----------------------------------------------------------
+  // FEATURE 1: AI MAINTENANCE SUMMARY
+  // ----------------------------------------------------------
+
   generateMaintenanceSummary: async (inspectionNotes) => {
-    if (!inspectionNotes || inspectionNotes.trim().length < 5) {
-      throw new Error('Inspection notes are too short for generating an AI summary.');
+    if (
+      !inspectionNotes ||
+      typeof inspectionNotes !== 'string' ||
+      inspectionNotes.trim().length < 5
+    ) {
+      throw new Error(
+        'Inspection notes are too short for generating an AI summary.'
+      );
     }
 
+    const notes = inspectionNotes.trim();
+
     if (!hasAIKey()) {
-      return `[SYSTEM DRAFT REPORT]
-Asset inspected and processed successfully. Corrected physical and internal operational thresholds. System calibrated and fully validated for continuous service. No further anomalies observed. Notes recorded: "${inspectionNotes}"`;
+      return getMaintenanceSummaryFallback(notes);
     }
 
     try {
-      const prompt = `Convert the following rough maintenance notes written by a technician into a formal, professional, structured engineering maintenance report: "${inspectionNotes}"`;
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.0-flash',
-        contents: prompt,
-        config: {
-          systemInstruction: 'You are an expert facilities management engineer. Output only the clean, polished maintenance report.'
-        }
+      const prompt = `
+Convert the following rough maintenance notes into a formal,
+professional engineering maintenance report.
+
+Include:
+- Work performed
+- Observations
+- Issues identified
+- Corrective actions
+- Recommended follow-up
+
+Do not invent measurements, repairs or inspection results.
+
+Technician Notes:
+${notes}
+`;
+
+      const response = await generateAIContent(prompt, {
+        systemInstruction:
+          'You are an expert facilities management and maintenance engineer. Generate accurate, professional maintenance reports. Never invent technical facts.',
       });
-      return response.text.trim();
+
+      return getResponseText(response);
+
     } catch (err) {
-      console.error('AI Maintenance Summary Error:', err);
-      return `[ENGINEERING AUTO-REPORT] Rough notes recorded: "${inspectionNotes}". Maintenance verified. All systems operational.`;
+      handleAIError('generateMaintenanceSummary', err);
+      return getMaintenanceSummaryFallback(notes);
     }
   },
 
-  /**
-   * 2. AI Preventive Maintenance Recommendation
-   * Suggests next service actions, inspection schedule, and replacement alerts.
-   */
+  // ----------------------------------------------------------
+  // FEATURE 2: AI PREVENTIVE MAINTENANCE RECOMMENDATION
+  // ----------------------------------------------------------
+
   getPreventiveRecommendation: async (assetId) => {
     try {
       const asset = await Asset.findById(assetId);
-      if (!asset) throw new Error('Asset not found');
 
-      const issues = await Issue.find({ assetId });
-      const maints = await Maintenance.find({ assetId });
+      if (!asset) {
+        throw new Error('Asset not found.');
+      }
+
+      const [issues, maintenances] = await Promise.all([
+        Issue.find({ assetId }),
+        Maintenance.find({ assetId }),
+      ]);
 
       const assetSummary = `
 Asset Name: ${asset.assetName}
@@ -73,275 +254,467 @@ Category: ${asset.category}
 Location: ${asset.location}
 Current Condition: ${asset.condition}
 Current Status: ${asset.status}
+Next Service: ${asset.nextService || 'Not specified'}
+
 Total Logged Issues: ${issues.length}
-Total Maintenance Records: ${maints.length}
+Total Maintenance Records: ${maintenances.length}
+
+Recent Issues:
+${issues.slice(0, 10).map((issue) => `
+- Title: ${issue.title || 'N/A'}
+- Category: ${issue.category || 'N/A'}
+- Priority: ${issue.priority || 'N/A'}
+- Status: ${issue.status || 'N/A'}
+`).join('\n')}
 `;
 
       if (!hasAIKey()) {
-        return {
-          suggestedNextMaintenance: asset.nextService || 'Next Quarter',
-          suggestedReplacement: asset.condition === 'Poor' ? 'Highly Recommended in next 3 months' : 'No replacement needed',
-          inspectionSchedule: 'Every 30 days standard visual inspection',
-          narrative: 'Perform routine scheduled inspections, calibrate sensors, and clean operational surfaces.'
-        };
+        return getPreventiveRecommendationFallback(asset);
       }
 
-      const prompt = `Analyze this asset's context and suggest a structured preventive maintenance strategy: ${assetSummary}`;
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.0-flash',
-        contents: prompt,
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              suggestedNextMaintenance: { type: Type.STRING, description: "Specific date or interval (e.g., 'Within 15 Days')" },
-              suggestedReplacement: { type: Type.STRING, description: "Actionable alert regarding parts/asset replacement" },
-              inspectionSchedule: { type: Type.STRING, description: "Suggested recurring schedule (e.g. 'Bi-weekly', 'Monthly')" },
-              narrative: { type: Type.STRING, description: "Comprehensive recommendation brief" }
+      const prompt = `
+Analyze the following equipment information and generate
+a practical preventive maintenance recommendation.
+
+${assetSummary}
+
+Return recommendations based only on available information.
+Do not invent inspection results or equipment specifications.
+`;
+
+      const response = await generateAIContent(prompt, {
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            suggestedNextMaintenance: {
+              type: Type.STRING,
+              description:
+                'Suggested maintenance date or interval.',
             },
-            required: ["suggestedNextMaintenance", "suggestedReplacement", "inspectionSchedule", "narrative"]
-          }
-        }
+            suggestedReplacement: {
+              type: Type.STRING,
+              description:
+                'Actionable equipment or parts replacement recommendation.',
+            },
+            inspectionSchedule: {
+              type: Type.STRING,
+              description:
+                'Recommended recurring inspection schedule.',
+            },
+            narrative: {
+              type: Type.STRING,
+              description:
+                'Detailed preventive maintenance recommendation.',
+            },
+          },
+          required: [
+            'suggestedNextMaintenance',
+            'suggestedReplacement',
+            'inspectionSchedule',
+            'narrative',
+          ],
+        },
       });
 
-      return JSON.parse(response.text.trim());
+      return parseAIJson(response);
+
     } catch (err) {
-      console.error('AI Preventive Recommendation Error:', err);
+      handleAIError('getPreventiveRecommendation', err);
+
+      // Preserve actual database errors rather than hiding them.
+      if (err.message === 'Asset not found.') {
+        throw err;
+      }
+
       return {
         suggestedNextMaintenance: 'Standard schedule',
-        suggestedReplacement: 'Inspect during next routine block',
-        inspectionSchedule: 'Standard interval (Monthly)',
-        narrative: 'Ensure physical surfaces are clean and clear of obstruction.'
+        suggestedReplacement: 'Inspect during next routine maintenance.',
+        inspectionSchedule: 'Monthly inspection',
+        narrative:
+          'AI recommendations are temporarily unavailable. Follow the approved maintenance schedule and inspect critical equipment components.',
       };
     }
   },
 
-  /**
-   * 3. AI Similar Issue Finder
-   * Finds previously resolved issues and summarizes their solutions to guide technicians.
-   */
+  // ----------------------------------------------------------
+  // FEATURE 3: AI SIMILAR ISSUE FINDER
+  // ----------------------------------------------------------
+
   findSimilarIssues: async (description, category) => {
     try {
-      // Find historical issues that are resolved/closed
-      const query = { status: { $in: ['Resolved', 'Closed'] } };
+      if (
+        !description ||
+        typeof description !== 'string' ||
+        !description.trim()
+      ) {
+        return [];
+      }
+
+      const query = {
+        status: { $in: ['Resolved', 'Closed'] },
+      };
+
       if (category) {
         query.category = category;
       }
+
       const historicalIssues = await Issue.find(query).limit(10);
-      
+
       if (historicalIssues.length === 0) {
         return [];
       }
 
-      // Format for Gemini comparison
-      const formattedHistory = historicalIssues.map(i => ({
-        id: i._id,
-        title: i.title,
-        description: i.description,
-        category: i.category,
-        issueNumber: i.issueNumber
-      }));
-
       if (!hasAIKey()) {
-        // Return 1 standard match
         const firstMatch = historicalIssues[0];
+
         return [{
-          issueNumber: firstMatch.issueNumber,
-          title: firstMatch.title,
+          issueNumber: firstMatch.issueNumber || 'N/A',
+          title: firstMatch.title || 'Historical issue',
           similarityScore: 85,
-          recommendedAction: 'Verify structural fasteners and electrical connectivity.'
+          recommendedAction:
+            'Review the historical repair notes and verify the affected components.',
         }];
       }
 
-      const prompt = `Compare this newly reported issue: "${description}" against the list of historical issues: ${JSON.stringify(formattedHistory)}. Return the most similar issues and their solutions.`;
+      const formattedHistory = historicalIssues.map((issue) => ({
+        issueNumber: issue.issueNumber || 'N/A',
+        title: issue.title || 'N/A',
+        description: issue.description || 'N/A',
+        category: issue.category || 'N/A',
+      }));
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.0-flash',
-        contents: prompt,
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                issueNumber: { type: Type.STRING },
-                title: { type: Type.STRING },
-                similarityScore: { type: Type.INTEGER, description: "Percentage from 0 to 100" },
-                recommendedAction: { type: Type.STRING, description: "Recommended repair action based on history" }
+      const prompt = `
+Compare this newly reported issue against the historical resolved issues.
+
+New Issue:
+${description}
+
+Category:
+${category || 'Not specified'}
+
+Historical Issues:
+${JSON.stringify(formattedHistory, null, 2)}
+
+Return the most relevant matches.
+Only recommend actions supported by the available historical information.
+Return an empty array if there are no meaningful matches.
+`;
+
+      const response = await generateAIContent(prompt, {
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              issueNumber: {
+                type: Type.STRING,
               },
-              required: ["issueNumber", "title", "similarityScore", "recommendedAction"]
-            }
-          }
-        }
+              title: {
+                type: Type.STRING,
+              },
+              similarityScore: {
+                type: Type.INTEGER,
+                description: 'Similarity percentage from 0 to 100.',
+              },
+              recommendedAction: {
+                type: Type.STRING,
+              },
+            },
+            required: [
+              'issueNumber',
+              'title',
+              'similarityScore',
+              'recommendedAction',
+            ],
+          },
+        },
       });
 
-      return JSON.parse(response.text.trim());
+      const results = parseAIJson(response);
+
+      if (!Array.isArray(results)) {
+        throw new Error('Invalid similar issue response format.');
+      }
+
+      return results;
+
     } catch (err) {
-      console.error('AI Similar Issue Finder Error:', err);
+      handleAIError('findSimilarIssues', err);
       return [];
     }
   },
 
-  /**
-   * 4. AI Asset Health Score
-   * Calculates a score from 0-100 based on failure frequency, maintenance, and severity.
-   */
+  // ----------------------------------------------------------
+  // FEATURE 4: ASSET HEALTH SCORE
+  // ----------------------------------------------------------
+
   calculateAssetHealthScore: async (assetId) => {
     try {
       const asset = await Asset.findById(assetId);
-      if (!asset) return 100;
 
-      const totalIssues = await Issue.countDocuments({ assetId });
-      const criticalIssues = await Issue.countDocuments({ assetId, priority: { $in: ['High', 'Critical'] } });
-      const unresolvedIssues = await Issue.countDocuments({ assetId, status: { $nin: ['Resolved', 'Closed'] } });
+      if (!asset) {
+        return 100;
+      }
+
+      const [
+        totalIssues,
+        criticalIssues,
+        unresolvedIssues,
+      ] = await Promise.all([
+        Issue.countDocuments({ assetId }),
+
+        Issue.countDocuments({
+          assetId,
+          priority: { $in: ['High', 'Critical'] },
+        }),
+
+        Issue.countDocuments({
+          assetId,
+          status: { $nin: ['Resolved', 'Closed'] },
+        }),
+      ]);
 
       let baseScore = 100;
 
-      // Condition deductions
-      if (asset.condition === 'Good') baseScore -= 10;
-      if (asset.condition === 'Fair') baseScore -= 25;
-      if (asset.condition === 'Poor') baseScore -= 50;
+      if (asset.condition === 'Good') {
+        baseScore -= 10;
+      }
 
-      // Issue deductions
-      baseScore -= (totalIssues * 5);
-      baseScore -= (criticalIssues * 15);
-      baseScore -= (unresolvedIssues * 10);
+      if (asset.condition === 'Fair') {
+        baseScore -= 25;
+      }
 
-      // Bound score
+      if (asset.condition === 'Poor') {
+        baseScore -= 50;
+      }
+
+      baseScore -= totalIssues * 5;
+      baseScore -= criticalIssues * 15;
+      baseScore -= unresolvedIssues * 10;
+
       return Math.max(0, Math.min(100, baseScore));
+
     } catch (err) {
-      console.error('Calculate Asset Health Score Error:', err);
+      console.error(
+        '❌ Calculate Asset Health Score Error:',
+        err.message
+      );
+
       return 100;
     }
   },
 
-  /**
-   * 5. AI Risk Assessment
-   * Categorizes asset operational risk (Low, Medium, High, Critical) based on logs.
-   */
+  // ----------------------------------------------------------
+  // FEATURE 5: ASSET RISK ASSESSMENT
+  // ----------------------------------------------------------
+
   calculateRiskAssessment: async (assetId) => {
     try {
       const asset = await Asset.findById(assetId);
-      if (!asset) return 'Low';
 
-      const criticalActive = await Issue.countDocuments({
-        assetId,
-        priority: 'Critical',
-        status: { $nin: ['Resolved', 'Closed'] }
-      });
+      if (!asset) {
+        return 'Low';
+      }
 
-      const highActive = await Issue.countDocuments({
-        assetId,
-        priority: 'High',
-        status: { $nin: ['Resolved', 'Closed'] }
-      });
+      const [criticalActive, highActive, totalActive] =
+        await Promise.all([
+          Issue.countDocuments({
+            assetId,
+            priority: 'Critical',
+            status: { $nin: ['Resolved', 'Closed'] },
+          }),
 
-      if (criticalActive > 0 || asset.condition === 'Poor') return 'Critical';
-      if (highActive > 0 || asset.condition === 'Fair') return 'High';
-      
-      const totalActive = await Issue.countDocuments({
-        assetId,
-        status: { $nin: ['Resolved', 'Closed'] }
-      });
+          Issue.countDocuments({
+            assetId,
+            priority: 'High',
+            status: { $nin: ['Resolved', 'Closed'] },
+          }),
 
-      if (totalActive > 1) return 'Medium';
+          Issue.countDocuments({
+            assetId,
+            status: { $nin: ['Resolved', 'Closed'] },
+          }),
+        ]);
+
+      if (criticalActive > 0 || asset.condition === 'Poor') {
+        return 'Critical';
+      }
+
+      if (highActive > 0 || asset.condition === 'Fair') {
+        return 'High';
+      }
+
+      if (totalActive > 1) {
+        return 'Medium';
+      }
+
       return 'Low';
+
     } catch (err) {
-      console.error('AI Risk Assessment Error:', err);
+      console.error(
+        '❌ AI Risk Assessment Error:',
+        err.message
+      );
+
       return 'Low';
     }
   },
 
-  /**
-   * 6 & 7. AI Estimated Repair Time and Cost
-   * Estimates duration and financial range based on issue details.
-   */
+  // ----------------------------------------------------------
+  // FEATURE 6 & 7: REPAIR TIME AND COST ESTIMATION
+  // ----------------------------------------------------------
+
   estimateRepairTimeAndCost: async (description, category) => {
     try {
       if (!hasAIKey()) {
-        return {
-          estimatedTimeMinutes: 120,
-          estimatedCostMin: 150,
-          estimatedCostMax: 400,
-          confidence: 'Medium'
-        };
+        return getRepairEstimateFallback();
       }
 
-      const prompt = `Provide repair time (in minutes) and repair cost range estimates (in USD) for a reported issue with category "${category}": "${description}"`;
+      if (!description || !description.trim()) {
+        throw new Error('Issue description is required.');
+      }
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.0-flash',
-        contents: prompt,
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              estimatedTimeMinutes: { type: Type.INTEGER, description: "Estimated time to resolve in minutes" },
-              estimatedCostMin: { type: Type.INTEGER, description: "Minimum estimated cost in USD" },
-              estimatedCostMax: { type: Type.INTEGER, description: "Maximum estimated cost in USD" },
-              confidence: { type: Type.STRING, description: "Low, Medium, or High" }
+      const prompt = `
+Estimate the repair duration and approximate repair cost
+for the following maintenance issue.
+
+Category: ${category || 'Not specified'}
+Description: ${description}
+
+Cost must be estimated in USD.
+Return reasonable estimates and a confidence level.
+Do not present estimates as confirmed quotations.
+`;
+
+      const response = await generateAIContent(prompt, {
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            estimatedTimeMinutes: {
+              type: Type.INTEGER,
+              description: 'Estimated repair duration in minutes.',
             },
-            required: ["estimatedTimeMinutes", "estimatedCostMin", "estimatedCostMax", "confidence"]
-          }
-        }
+            estimatedCostMin: {
+              type: Type.INTEGER,
+              description: 'Minimum estimated cost in USD.',
+            },
+            estimatedCostMax: {
+              type: Type.INTEGER,
+              description: 'Maximum estimated cost in USD.',
+            },
+            confidence: {
+              type: Type.STRING,
+              description: 'Low, Medium, or High.',
+            },
+          },
+          required: [
+            'estimatedTimeMinutes',
+            'estimatedCostMin',
+            'estimatedCostMax',
+            'confidence',
+          ],
+        },
       });
 
-      return JSON.parse(response.text.trim());
+      const result = parseAIJson(response);
+
+      if (
+        !Number.isFinite(result.estimatedTimeMinutes) ||
+        !Number.isFinite(result.estimatedCostMin) ||
+        !Number.isFinite(result.estimatedCostMax) ||
+        result.estimatedTimeMinutes < 0 ||
+        result.estimatedCostMin < 0 ||
+        result.estimatedCostMax < result.estimatedCostMin
+      ) {
+        throw new Error('Gemini returned invalid repair estimates.');
+      }
+
+      return result;
+
     } catch (err) {
-      console.error('AI Estimate Repair Error:', err);
-      return {
-        estimatedTimeMinutes: 90,
-        estimatedCostMin: 100,
-        estimatedCostMax: 250,
-        confidence: 'Low'
-      };
+      handleAIError('estimateRepairTimeAndCost', err);
+      return getRepairEstimateFallback();
     }
   },
 
-  /**
-   * 8. AI Technician Recommendation
-   * Scans technicians and automatically suggests the best candidate based on past work.
-   */
+  // ----------------------------------------------------------
+  // FEATURE 8: TECHNICIAN RECOMMENDATION
+  // ----------------------------------------------------------
+
   recommendTechnician: async (issueCategory) => {
     try {
-      const technicians = await User.find({ role: 'Technician' });
-      if (technicians.length === 0) return null;
-
-      // Retrieve previous maintenances to count categories
-      const maints = await Maintenance.find({});
-      const techStats = {};
-
-      technicians.forEach(t => {
-        techStats[t._id] = { id: t._id, name: t.name, matchCount: 0 };
+      const technicians = await User.find({
+        role: 'Technician',
       });
 
-      // Simple recommendation rule: count category match
-      const matchingIssues = await Issue.find({ category: issueCategory, status: 'Resolved' });
-      matchingIssues.forEach(i => {
-        if (i.assignedTechnician && techStats[i.assignedTechnician]) {
-          techStats[i.assignedTechnician].matchCount += 1;
+      if (technicians.length === 0) {
+        return null;
+      }
+
+      const matchingIssues = await Issue.find({
+        category: issueCategory,
+        status: 'Resolved',
+        assignedTechnician: { $ne: null },
+      });
+
+      const techStats = {};
+
+      technicians.forEach((technician) => {
+        const id = technician._id.toString();
+
+        techStats[id] = {
+          id: technician._id,
+          name: technician.name,
+          matchCount: 0,
+        };
+      });
+
+      matchingIssues.forEach((issue) => {
+        if (!issue.assignedTechnician) {
+          return;
+        }
+
+        const technicianId =
+          issue.assignedTechnician.toString();
+
+        if (techStats[technicianId]) {
+          techStats[technicianId].matchCount += 1;
         }
       });
 
-      // Sort by match count descending
-      const recommendations = Object.values(techStats).sort((a, b) => b.matchCount - a.matchCount);
-      const topTechId = recommendations[0]?.id || technicians[0]._id;
-      const topTech = technicians.find(t => t._id === topTechId);
+      const recommendations = Object.values(techStats).sort(
+        (a, b) => b.matchCount - a.matchCount
+      );
+
+      const topTechnician = recommendations[0];
+
+      if (!topTechnician) {
+        return null;
+      }
 
       return {
-        id: topTech._id,
-        name: topTech.name,
-        confidenceScore: recommendations[0]?.matchCount > 0 ? 95 : 75,
-        reason: recommendations[0]?.matchCount > 0 
-          ? `Highest number of resolved cases (${recommendations[0].matchCount}) under category ${issueCategory}` 
-          : `Assigned based on facility availability for category ${issueCategory}`
+        id: topTechnician.id,
+        name: topTechnician.name,
+
+        confidenceScore:
+          topTechnician.matchCount > 0 ? 95 : 75,
+
+        reason:
+          topTechnician.matchCount > 0
+            ? `Highest number of resolved cases (${topTechnician.matchCount}) under category ${issueCategory}.`
+            : `Suggested based on technician availability for category ${issueCategory}.`,
       };
+
     } catch (err) {
-      console.error('AI Tech Recommendation Error:', err);
+      console.error(
+        '❌ Technician Recommendation Error:',
+        err.message
+      );
+
       return null;
     }
-  }
+  },
 };

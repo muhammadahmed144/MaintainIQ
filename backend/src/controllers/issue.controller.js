@@ -122,7 +122,12 @@ export const triageIssueAI = async (req, res) => {
     const parsedTriage = JSON.parse(response.text.trim());
     res.json({ triage: parsedTriage });
   } catch (err) {
-    console.error('Gemini Triage Error:', err);
+    const errMsg = err.message || '';
+    if (err.status === 429 || errMsg.includes('quota') || errMsg.includes('RESOURCE_EXHAUSTED')) {
+      console.warn("⚠️ Gemini API Quota/Rate Limit Exceeded in triageIssueAI. Falling back to manual triage.");
+    } else {
+      console.error('Gemini Triage Error:', err);
+    }
     res.status(500).json({ error: 'AI Triage engine was unable to parse your request. Please manually complete triage.' });
   }
 };

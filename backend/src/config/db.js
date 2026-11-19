@@ -5,6 +5,10 @@
 
 import mongoose from 'mongoose';
 import bcrypt from 'bcryptjs';
+import dns from 'node:dns';
+
+// Force use of Cloudflare + Google DNS to fix Atlas SRV lookup failures
+dns.setServers(['1.1.1.1', '8.8.8.8']);
 import User from '../models/User.js';
 import Asset from '../models/Asset.js';
 import Issue from '../models/Issue.js';
@@ -312,7 +316,11 @@ export async function connectDB() {
   }
 
   try {
-    await mongoose.connect(uri);
+    await mongoose.connect(uri, {
+      serverSelectionTimeoutMS: 10000,
+      socketTimeoutMS: 45000,
+      family: 4, // Force IPv4
+    });
     console.log("🔌 MongoDB Atlas connected successfully");
     await seedDatabase();
   } catch (error) {
